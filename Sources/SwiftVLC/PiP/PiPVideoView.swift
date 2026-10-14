@@ -28,6 +28,8 @@ public struct PiPVideoView: UIViewRepresentable {
   /// (`makeUIView`); SwiftUI updates that merely re-render this struct with a
   /// different value do not reconfigure an existing view. Audio-session
   /// ownership is inherited from ``Player/appleAudioSessionPolicy``.
+  /// Use ``PiPController/setStartsAutomaticallyFromInline(_:)`` to change
+  /// admission on the existing controller without replacing the surface.
   ///
   /// - Parameters:
   ///   - player: The player whose video output to display.

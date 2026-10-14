@@ -209,7 +209,7 @@ public final class PiPController: NSObject {
   /// Set by ``PiPVideoView``'s `startsAutomaticallyFromInline` knob;
   /// the direct public ``init(player:)`` path uses `true`.
   @ObservationIgnored
-  let startsAutomaticallyFromInline: Bool
+  private(set) var startsAutomaticallyFromInline: Bool
 
   /// Whether this controller configures and activates the shared
   /// `AVAudioSession` (iOS only). Direct construction and the current
@@ -539,6 +539,35 @@ public final class PiPController: NSObject {
   public var layer: AVSampleBufferDisplayLayer {
     displayLayer
   }
+
+  #if os(iOS)
+  /// Changes automatic inline PiP admission without replacing the video surface.
+  ///
+  /// Construct ``PiPVideoView`` with `startsAutomaticallyFromInline: false`
+  /// when playback requires an initial admission barrier. Its immutable native
+  /// drawable policy keeps newly allocated controllers disabled until SwiftVLC
+  /// adopts them; this method updates the live controller and the policy used
+  /// by later native-controller adoptions. It does not start or stop PiP or
+  /// change playback. Explicit PiP requests remain available.
+  ///
+  /// - Returns: `false` if this controller has been invalidated or no longer
+  ///   owns its rendering attachment. A refused change leaves the live and
+  ///   stored policies untouched.
+  @discardableResult
+  public func setStartsAutomaticallyFromInline(_ enabled: Bool) -> Bool {
+    guard !didInvalidateForLifecycleEnd else { return false }
+    if let nativeBackend {
+      guard nativeBackend.setStartsAutomaticallyFromInline(enabled, ifOwnedBy: self) else {
+        return false
+      }
+    } else {
+      guard callbackRegistration?.isBound == true else { return false }
+      pipController?.canStartPictureInPictureAutomaticallyFromInline = enabled
+    }
+    startsAutomaticallyFromInline = enabled
+    return true
+  }
+  #endif
 
   /// Creates a PiP controller for the given player.
   ///

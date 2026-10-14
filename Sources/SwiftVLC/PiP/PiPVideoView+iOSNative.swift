@@ -1365,6 +1365,18 @@ final class IOSNativePiPBackend: NSObject, @unchecked Sendable {
     avPictureInPictureController?.canStartPictureInPictureAutomaticallyFromInline = enabled
   }
 
+  /// A retained predecessor must not change either the successor's live AVKit
+  /// controller or the cached policy applied when its native output is ready.
+  @discardableResult
+  func setStartsAutomaticallyFromInline(
+    _ enabled: Bool,
+    ifOwnedBy expectedOwner: PiPController
+  ) -> Bool {
+    guard ownsCurrentAttachment(expectedOwner) else { return false }
+    setStartsAutomaticallyFromInline(enabled)
+    return true
+  }
+
   func invalidatePlaybackState(ifOwnedBy expectedOwner: PiPController) {
     guard ownsCurrentAttachment(expectedOwner) else { return }
     invalidatePlaybackState()
