@@ -640,6 +640,177 @@ extension Integration {
     }
 
     @Test
+    func `macOS private PiP synchronous close cannot publish active after returning inline`() throws {
+      let context = try MacPrivatePiPTestContext()
+      let drawable = context.host.drawableView
+      var activeStates: [Bool] = []
+      context.controller.onPresent = { [weak controller = context.controller] in
+        let delegate = controller?.delegate as? MacPrivatePiPDelegate
+        delegate?.willClose()
+        delegate?.didClose()
+      }
+
+      let didStart = context.start { isActive in
+        activeStates.append(isActive)
+        if !isActive {
+          #expect(drawable.superview === context.host)
+          #expect(context.player.macPiPOutputRebindSnapshot?.phase == .active)
+        }
+      }
+
+      #expect(!didStart)
+      #expect(!context.presenter.isActive)
+      #expect(drawable.superview === context.host)
+      expectNoDifference(activeStates, [false])
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+    }
+
+    @Test
+    func `macOS private PiP duplicate start preserves its exact output activation`() throws {
+      let context = try MacPrivatePiPTestContext()
+      #expect(context.start())
+      let activation = try #require(context.player.macPiPOutputRebindSnapshot)
+      #expect(activation.phase == .active)
+
+      #expect(context.start())
+
+      #expect(context.controller.presentCount == 1)
+      #expect(context.player.macPiPOutputRebindSnapshot == activation)
+      let delegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      delegate.didClose()
+    }
+
+    @Test
+    func `macOS private PiP abandonment revokes restoration and output recovery`() throws {
+      let context = try MacPrivatePiPTestContext()
+      let drawable = context.host.drawableView
+      #expect(context.start())
+      let delegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+
+      context.presenter.abandonRestorationTarget()
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+      delegate.willClose()
+      delegate.didClose()
+
+      #expect(!context.presenter.isActive)
+      #expect(drawable.superview !== context.host)
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+    }
+
+    @Test
+    func `macOS private PiP missing weak host aborts output recovery`() throws {
+      let player = Player(instance: TestInstance.shared)
+      try player.load(Media(url: TestMedia.twosecURL))
+      let controller = MacPrivatePiPViewControllerProbe()
+      let presenter = MacPrivatePiPPresenter(pictureInPictureViewControllerFactory: { controller })
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+      let weakHost = try autoreleasepool {
+        let host = MacNativePiPHostView()
+        let weakHost = MacWeakBox(host)
+        let didStart = presenter.start(
+          player: player,
+          hostView: host,
+          drawableView: host.drawableView,
+          mediaController: mediaController,
+          onActiveChanged: { _ in },
+          onPlay: {},
+          onPause: {}
+        )
+        try #require(didStart)
+        return weakHost
+      }
+      let delegate = try #require(controller.delegate as? MacPrivatePiPDelegate)
+
+      #expect(weakHost.value == nil)
+      delegate.didClose()
+
+      #expect(!presenter.isActive)
+      #expect(player.macPiPOutputRebindSnapshot?.phase == .aborted)
+    }
+
+    @Test(arguments: [true, false])
+    func `macOS private PiP inactive callback can revoke pending output recovery`(relinquishes: Bool) throws {
+      let context = try MacPrivatePiPTestContext()
+      let didStart = context.start { isActive in
+        if !isActive {
+          #expect(context.host.drawableView.superview === context.host)
+          #expect(context.player.macPiPOutputRebindSnapshot?.phase == .active)
+          if relinquishes {
+            context.presenter.relinquish(hostView: context.host, drawableView: context.host.drawableView)
+          } else {
+            context.presenter.abandonRestorationTarget()
+          }
+          #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+        }
+      }
+      #expect(didStart)
+      let delegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+
+      delegate.didClose()
+
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+      #expect(!context.presenter.isActive)
+    }
+
+    @Test
+    func `macOS private PiP inactive callback can start a successor and relinquish only its retired target`() throws {
+      let context = try MacPrivatePiPTestContext()
+      let successorHost = MacNativePiPHostView()
+      var successorStates: [Bool] = []
+      let didStart = context.start { isActive in
+        if !isActive {
+          let successorDidStart = context.presenter.start(
+            player: context.player,
+            hostView: successorHost,
+            drawableView: successorHost.drawableView,
+            mediaController: context.mediaController,
+            onActiveChanged: { successorStates.append($0) },
+            onPlay: {},
+            onPause: {}
+          )
+          #expect(successorDidStart)
+          context.presenter.relinquish(hostView: context.host, drawableView: context.host.drawableView)
+        }
+      }
+      #expect(didStart)
+      let retiredDelegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+
+      retiredDelegate.didClose()
+
+      #expect(context.presenter.isActive)
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .active)
+      expectNoDifference(successorStates, [true])
+      let successorDelegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      successorDelegate.didClose()
+      expectNoDifference(successorStates, [true, false])
+    }
+
+    @Test
+    func `macOS private PiP retired delegate and dismissal completion cannot close a successor`() async throws {
+      let context = try MacPrivatePiPTestContext()
+      context.controller.completesDismissalImmediately = false
+      #expect(context.start())
+      let retiredDelegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      context.presenter.stop()
+      let retiredCompletion = try #require(context.controller.pendingDismissalCompletion)
+      retiredDelegate.didClose()
+
+      #expect(context.start())
+      let successorActivation = try #require(context.player.macPiPOutputRebindSnapshot)
+      retiredDelegate.willClose()
+      retiredDelegate.didClose()
+      retiredCompletion()
+      await Task.yield()
+
+      #expect(context.presenter.isActive)
+      #expect(context.player.macPiPOutputRebindSnapshot == successorActivation)
+      #expect(context.controller.presentedViewController?.view === context.host.drawableView)
+      let delegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      delegate.didClose()
+    }
+
+    @Test
     func `macOS native PiP rejects instances without video output`() throws {
       let instance = try VLCInstance(arguments: ["--no-video-title-show", "--no-video", "--no-audio", "--quiet"])
       let player = Player(instance: instance)

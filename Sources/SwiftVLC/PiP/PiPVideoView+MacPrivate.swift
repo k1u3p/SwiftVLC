@@ -230,14 +230,44 @@ final class MacPrivatePiPPresenter {
   private let pictureInPictureViewControllerFactory: @MainActor () -> NSViewController?
   private weak var hostView: MacNativePiPHostView?
   private weak var drawableView: MacNativePiPDrawableView?
-  private weak var player: Player?
   private var pictureInPictureViewController: NSViewController?
   private var contentViewController: NSViewController?
   private var delegate: MacPrivatePiPDelegate?
   private var onActiveChanged: (@MainActor @Sendable (Bool) -> Void)?
   private var dismissalCompletion: MacPrivatePiPDismissCompletion?
   private var isClosing = false
-  private var didPresentDrawable = false
+  private var nextPresentationToken: UInt64 = 0
+  private var presentationToken: UInt64?
+  @MainActor private final class OutputReturn {
+    weak var player: Player?
+    weak var hostView: MacNativePiPHostView?
+    weak var drawableView: MacNativePiPDrawableView?
+    let activationRevision: UInt64
+    var isAbandoned = false
+
+    init(
+      player: Player,
+      hostView: MacNativePiPHostView,
+      drawableView: MacNativePiPDrawableView,
+      activationRevision: UInt64
+    ) {
+      self.player = player
+      self.hostView = hostView
+      self.drawableView = drawableView
+      self.activationRevision = activationRevision
+    }
+
+    func matches(hostView: MacNativePiPHostView, drawableView: MacNativePiPDrawableView) -> Bool {
+      self.hostView === hostView && self.drawableView === drawableView
+    }
+
+    func abandon() {
+      isAbandoned = true
+      player?.updateMacPiPOutputRebind(activationRevision, phase: .aborted)
+    }
+  }
+  private var outputReturn: OutputReturn?
+  private var pendingOutputReturns: [OutputReturn] = []
 
   init(
     pictureInPictureViewControllerFactory: (@MainActor () -> NSViewController?)? = nil
@@ -257,9 +287,16 @@ final class MacPrivatePiPPresenter {
   ) {
     self.hostView = hostView
     self.drawableView = drawableView
+    outputReturn?.hostView = hostView
+    outputReturn?.drawableView = drawableView
   }
 
   func abandonRestorationTarget() {
+    outputReturn?.abandon()
+    outputReturn = nil
+    for pendingReturn in pendingOutputReturns {
+      pendingReturn.abandon()
+    }
     hostView = nil
     drawableView = nil
   }
@@ -268,7 +305,13 @@ final class MacPrivatePiPPresenter {
     hostView: MacNativePiPHostView,
     drawableView: MacNativePiPDrawableView
   ) {
+    for pendingReturn in pendingOutputReturns
+    where pendingReturn.matches(hostView: hostView, drawableView: drawableView) {
+      pendingReturn.abandon()
+    }
     guard self.hostView === hostView, self.drawableView === drawableView else { return }
+    outputReturn?.abandon()
+    outputReturn = nil
     self.hostView = nil
     self.drawableView = nil
   }
@@ -292,19 +335,22 @@ final class MacPrivatePiPPresenter {
 
     self.hostView = hostView
     self.drawableView = drawableView
-    self.player = player
+    precondition(nextPresentationToken < UInt64.max)
+    nextPresentationToken += 1
+    let presentationToken = nextPresentationToken
+    self.presentationToken = presentationToken
     self.pictureInPictureViewController = pictureInPictureViewController
     self.onActiveChanged = onActiveChanged
 
     let delegate = MacPrivatePiPDelegate()
     delegate.shouldClose = { [weak self] in
-      self?.prepareToClose() ?? true
+      self?.prepareToClose(presentationToken) ?? true
     }
     delegate.willClose = { [weak self] in
-      _ = self?.beginClose()
+      _ = self?.beginClose(presentationToken)
     }
     delegate.didClose = { [weak self] in
-      self?.finish()
+      self?.finish(presentationToken)
     }
     delegate.play = onPlay
     delegate.pause = onPause
@@ -325,28 +371,42 @@ final class MacPrivatePiPPresenter {
         hostView: hostView,
         isPlaying: mediaController.isMediaPlaying()
       ) else {
-      finish()
+      finish(presentationToken)
       return false
     }
 
+    guard self.presentationToken == presentationToken, !isClosing else { return false }
+    if let activationRevision = player.beginMacPiPOutputRebindActivation() {
+      outputReturn = OutputReturn(
+        player: player,
+        hostView: hostView,
+        drawableView: drawableView,
+        activationRevision: activationRevision
+      )
+    }
     _ = pictureInPictureViewController.perform(
       MacPrivatePiPSelector.present,
       with: contentViewController
     )
-    didPresentDrawable = true
+    guard
+      self.presentationToken == presentationToken,
+      self.pictureInPictureViewController === pictureInPictureViewController,
+      !isClosing
+    else { return false }
     onActiveChanged(true)
     return true
   }
 
   func stop() {
+    guard let presentationToken else { return }
     guard let pictureInPictureViewController else {
-      finish()
+      finish(presentationToken)
       return
     }
     guard !isClosing else { return }
 
-    _ = beginClose()
-    if dismissUsingPrivateAPI(pictureInPictureViewController) {
+    _ = beginClose(presentationToken)
+    if dismissUsingPrivateAPI(pictureInPictureViewController, presentationToken: presentationToken) {
       return
     }
 
@@ -355,7 +415,7 @@ final class MacPrivatePiPPresenter {
       contentViewController.presentingViewController === pictureInPictureViewController {
       pictureInPictureViewController.dismiss(contentViewController)
     } else {
-      finish()
+      finish(presentationToken)
     }
   }
 
@@ -370,14 +430,16 @@ final class MacPrivatePiPPresenter {
   }
 
   @discardableResult
-  private func beginClose() -> Bool {
-    let canClose = prepareToClose()
-    restoreDrawableBeforeWindowTeardown()
+  private func beginClose(_ presentationToken: UInt64) -> Bool {
+    guard self.presentationToken == presentationToken else { return true }
+    let canClose = prepareToClose(presentationToken)
+    _ = restoreDrawableBeforeWindowTeardown()
     return canClose
   }
 
   @discardableResult
-  private func prepareToClose() -> Bool {
+  private func prepareToClose(_ presentationToken: UInt64) -> Bool {
+    guard self.presentationToken == presentationToken else { return true }
     guard pictureInPictureViewController != nil else { return true }
     isClosing = true
     return prepareForClose()
@@ -402,14 +464,17 @@ final class MacPrivatePiPPresenter {
     return didSetWindow && didSetRect
   }
 
-  private func dismissUsingPrivateAPI(_ pictureInPictureViewController: NSViewController) -> Bool {
+  private func dismissUsingPrivateAPI(
+    _ pictureInPictureViewController: NSViewController,
+    presentationToken: UInt64
+  ) -> Bool {
     guard pictureInPictureViewController.responds(to: MacPrivatePiPSelector.dismiss) else {
       return false
     }
 
     let completion: MacPrivatePiPDismissCompletion = { [weak self] in
       Task { @MainActor in
-        self?.finish()
+        self?.finish(presentationToken)
       }
     }
     dismissalCompletion = completion
@@ -420,39 +485,66 @@ final class MacPrivatePiPPresenter {
     return true
   }
 
-  private func finish() {
+  private func finish(_ presentationToken: UInt64) {
+    guard self.presentationToken == presentationToken else { return }
     guard pictureInPictureViewController != nil || isClosing else { return }
 
-    let playerToRecover = didPresentDrawable ? player : nil
+    let returningOutput = outputReturn
+    let activeChanged = onActiveChanged
+    if let returningOutput {
+      pendingOutputReturns.append(returningOutput)
+    }
 
     // `pipWillClose:` normally restores the drawable while the floating
     // window's graphics context is still alive. Keep this call as an
     // idempotent fallback for failed presentation and runtimes that finish
     // dismissal without sending the full delegate sequence.
-    restoreDrawableBeforeWindowTeardown()
+    if !restoreDrawableBeforeWindowTeardown() {
+      returningOutput?.abandon()
+    }
 
     pictureInPictureViewController = nil
     contentViewController = nil
     delegate = nil
     dismissalCompletion = nil
     isClosing = false
-    didPresentDrawable = false
+    self.presentationToken = nil
+    outputReturn = nil
     hostView = nil
     drawableView = nil
-    player = nil
-
-    onActiveChanged?(false)
     onActiveChanged = nil
-    playerToRecover?.reopenVideoOutputAfterDrawableWindowMove()
+
+    activeChanged?(false)
+    if let returningOutput {
+      if
+        !returningOutput.isAbandoned,
+        let player = returningOutput.player,
+        let recovery = player.reopenVideoOutputAfterDrawableWindowMove(
+          nativePiPActivationRevision: returningOutput.activationRevision
+        ) {
+        Task { @MainActor [weak self] in
+          await recovery.value
+          self?.pendingOutputReturns.removeAll { $0 === returningOutput }
+        }
+      } else {
+        pendingOutputReturns.removeAll { $0 === returningOutput }
+      }
+    }
   }
 
-  private func restoreDrawableBeforeWindowTeardown() {
-    guard let hostView, let drawableView else { return }
+  @discardableResult
+  private func restoreDrawableBeforeWindowTeardown() -> Bool {
+    guard
+      let hostView,
+      let drawableView,
+      hostView.drawableView === drawableView
+    else { return false }
 
     if contentViewController?.view === drawableView {
       contentViewController?.view = NSView(frame: .zero)
     }
     hostView.restoreDrawableView(drawableView)
+    return true
   }
 
   private func configure(

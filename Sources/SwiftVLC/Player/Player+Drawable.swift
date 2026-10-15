@@ -49,6 +49,40 @@ extension Player {
 #endif
 
 #if os(macOS)
+/// Durable command-ordering handoff for one native macOS PiP activation.
+/// Reselection submission does not establish that the renderer composed a frame.
+@_spi(PrivateMacOSPiP)
+public struct MacPiPOutputRebindSnapshot: Sendable, Equatable {
+  public enum Phase: Sendable, Equatable {
+    case active
+    case recovering
+    case reselectSubmitted(deselectionObserved: Bool)
+    case aborted
+  }
+
+  public let activationRevision: UInt64
+  public let playbackGeneration: PlaybackGeneration
+  public let nativeGeneration: NativePlayerGeneration
+  public let phase: Phase
+
+  public init(
+    activationRevision: UInt64,
+    playbackGeneration: PlaybackGeneration,
+    nativeGeneration: NativePlayerGeneration,
+    phase: Phase
+  ) {
+    self.activationRevision = activationRevision
+    self.playbackGeneration = playbackGeneration
+    self.nativeGeneration = nativeGeneration
+    self.phase = phase
+  }
+}
+
+enum MacVideoOutputRecoveryOutcome: Equatable {
+  case reselectSubmitted(deselectionObserved: Bool)
+  case aborted
+}
+
 @MainActor
 struct MacVideoOutputRecovery {
   let expectedTrackID: String
@@ -77,26 +111,33 @@ struct MacVideoOutputRecovery {
     self.reselectTrack = reselectTrack
   }
 
-  func run() async {
+  @discardableResult
+  func run() async -> MacVideoOutputRecoveryOutcome {
+    var observedDeselection = false
     for _ in 0..<maximumDeselectionPolls {
-      guard playbackIsCurrent() else { return }
-      guard let selectedTrackID = selectedTrackID() else { break }
-      guard selectedTrackID == expectedTrackID else { return }
+      guard !Task.isCancelled, playbackIsCurrent() else { return .aborted }
+      guard let selectedTrackID = selectedTrackID() else {
+        observedDeselection = true
+        break
+      }
+      guard selectedTrackID == expectedTrackID else { return .aborted }
       await waitForDeselection()
     }
 
-    guard playbackIsCurrent() else { return }
+    guard !Task.isCancelled, playbackIsCurrent() else { return .aborted }
     switch playbackState() {
     case .idle, .stopped, .stopping, .error:
-      return
+      return .aborted
     case .opening, .buffering, .playing, .paused:
       break
     }
 
     if let selectedTrackID = selectedTrackID() {
-      guard selectedTrackID == expectedTrackID else { return }
+      guard selectedTrackID == expectedTrackID else { return .aborted }
     }
+    guard !Task.isCancelled, playbackIsCurrent() else { return .aborted }
     reselectTrack(expectedTrackID)
+    return .reselectSubmitted(deselectionObserved: observedDeselection)
   }
 }
 
@@ -311,46 +352,102 @@ extension Player {
   }
 
   #if os(macOS)
-  /// Reopens the active video output after its AppKit drawable moves between
-  /// windows. `VLCOpenGLVideoView` owns an `NSOpenGLContext` whose window
-  /// surface can become invalid when macOS destroys the old PiP window even
-  /// though decoding and audio continue. Re-selecting the same video track
-  /// rebuilds only that output against the drawable's new inline window.
+  /// The most recent activation remains readable after its native recovery
+  /// finishes. Consumers must compare both generations and the exact revision.
+  @_spi(PrivateMacOSPiP)
+  public var macPiPOutputRebindSnapshot: MacPiPOutputRebindSnapshot? {
+    macPiPOutputRebindSnapshotStorage
+  }
+
+  @discardableResult
+  func beginMacPiPOutputRebindActivation() -> UInt64? {
+    guard !isShutdown, currentMedia != nil, nativeHandleRepresentsCurrentMedia else { return nil }
+    precondition(macPiPOutputRebindRevision < UInt64.max)
+    macPiPOutputRebindRevision += 1
+    macPiPOutputRebindSnapshotStorage = MacPiPOutputRebindSnapshot(
+      activationRevision: macPiPOutputRebindRevision,
+      playbackGeneration: generation,
+      nativeGeneration: nativeEventGeneration,
+      phase: .active
+    )
+    return macPiPOutputRebindRevision
+  }
+
+  private func ownsMacPiPOutputRebind(_ activation: UInt64) -> Bool {
+    guard let snapshot = macPiPOutputRebindSnapshotStorage else { return false }
+    return !isShutdown && currentMedia != nil && nativeHandleRepresentsCurrentMedia
+      && snapshot.activationRevision == activation
+      && snapshot.playbackGeneration == generation
+      && snapshot.nativeGeneration == nativeEventGeneration
+      && snapshot.phase != .aborted
+  }
+
+  func updateMacPiPOutputRebind(_ activation: UInt64, phase: MacPiPOutputRebindSnapshot.Phase) {
+    guard ownsMacPiPOutputRebind(activation), let snapshot = macPiPOutputRebindSnapshotStorage else { return }
+    macPiPOutputRebindSnapshotStorage = MacPiPOutputRebindSnapshot(
+      activationRevision: activation,
+      playbackGeneration: snapshot.playbackGeneration,
+      nativeGeneration: snapshot.nativeGeneration,
+      phase: phase
+    )
+  }
+
+  /// Rebuilds VLC's window-bound output against the restored inline drawable.
+  /// The scoped snapshot acknowledges only native track-reselection submission;
+  /// callers must independently qualify composed output.
   @discardableResult
   func reopenVideoOutputAfterDrawableWindowMove(
-    using native: MacVideoOutputRecoveryNativeOperations = .live
+    using native: MacVideoOutputRecoveryNativeOperations = .live,
+    nativePiPActivationRevision: UInt64? = nil
   ) -> Task<Void, Never>? {
-    guard
+    if let activation = nativePiPActivationRevision {
+      guard ownsMacPiPOutputRebind(activation),
+        macPiPOutputRebindSnapshotStorage?.phase == .active else { return nil }
+    }
+    guard !isShutdown, nativeHandleRepresentsCurrentMedia,
       let media = currentMedia,
       let trackID = native.selectedTrackID(pointer)
-    else { return nil }
+    else {
+      if let activation = nativePiPActivationRevision {
+        updateMacPiPOutputRebind(activation, phase: .aborted)
+      }
+      return nil
+    }
 
     let nativePlayer = pointer
+    let playbackGeneration = generation
+    let nativeGeneration = nativeEventGeneration
+    if let activation = nativePiPActivationRevision {
+      updateMacPiPOutputRebind(activation, phase: .recovering)
+    }
     native.unselectVideoTrack(nativePlayer)
 
     return Task { @MainActor [weak self, weak media] in
       guard let self else { return }
-
-      // Track selection is processed asynchronously by libVLC. Wait for the
-      // deselection to settle so selecting the same ID cannot be coalesced
-      // into a no-op that leaves the invalid OpenGL surface alive. Some VLC
-      // inputs keep their vout allocated while no video track is selected, so
-      // the selected-track state is the reliable acknowledgement here.
-      await MacVideoOutputRecovery(
+      let ownsRecovery: @MainActor () -> Bool = { [weak self, weak media] in
+        guard let self, let media else { return false }
+        return !isShutdown && nativeHandleRepresentsCurrentMedia
+          && pointer == nativePlayer && currentMedia === media
+          && generation == playbackGeneration && nativeEventGeneration == nativeGeneration
+          && (nativePiPActivationRevision.map { ownsMacPiPOutputRebind($0) } ?? true)
+      }
+      // libVLC may retain its vout/selection throughout the bounded wait. The
+      // final attempt still submits the reselect, with that distinction retained.
+      let outcome = await MacVideoOutputRecovery(
         expectedTrackID: trackID,
-        playbackIsCurrent: { [weak self, weak media] in
-          guard let self, let media else { return false }
-          return pointer == nativePlayer && currentMedia === media
-        },
+        playbackIsCurrent: { !Task.isCancelled && ownsRecovery() },
         playbackState: { [weak self] in self?.state ?? .idle },
         selectedTrackID: { native.selectedTrackID(nativePlayer) },
-        waitForDeselection: {
-          await native.waitForDeselection()
-        },
-        reselectTrack: { trackID in
-          native.reselectVideoTrack(nativePlayer, trackID)
-        }
+        waitForDeselection: { await native.waitForDeselection() },
+        reselectTrack: { native.reselectVideoTrack(nativePlayer, $0) }
       ).run()
+      guard ownsRecovery(), let activation = nativePiPActivationRevision else { return }
+      switch outcome {
+      case .reselectSubmitted(let observed):
+        updateMacPiPOutputRebind(activation, phase: .reselectSubmitted(deselectionObserved: observed))
+      case .aborted:
+        updateMacPiPOutputRebind(activation, phase: .aborted)
+      }
     }
   }
   #endif

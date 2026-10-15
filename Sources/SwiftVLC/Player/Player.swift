@@ -503,6 +503,10 @@ public final class Player {
   /// The native output captures this container for one handle's lifetime.
   /// Surface changes move it; handle replacement prepares a new container.
   @ObservationIgnored var nativeDrawableSurface: VideoSurface?
+  #if os(macOS)
+  @ObservationIgnored var macPiPOutputRebindRevision: UInt64 = 0
+  @ObservationIgnored var macPiPOutputRebindSnapshotStorage: MacPiPOutputRebindSnapshot?
+  #endif
   @ObservationIgnored var drawableOwner: ObjectIdentifier?
   @ObservationIgnored var needsDrawableRebindForPlayback = false
   @ObservationIgnored var nativePlayerHasHostedDrawable = false

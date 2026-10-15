@@ -37,11 +37,17 @@ final class MacPrivatePiPViewControllerProbe: NSViewController {
   @objc dynamic var aspectRatio: NSValue?
 
   private(set) var presentedViewController: NSViewController?
+  private(set) var presentCount = 0
   private(set) var dismissCount = 0
+  var onPresent: (() -> Void)?
+  var completesDismissalImmediately = true
+  private(set) var pendingDismissalCompletion: (() -> Void)?
 
   @objc(presentViewControllerAsPictureInPicture:)
   func presentAsPictureInPicture(_ viewController: NSViewController) {
     presentedViewController = viewController
+    presentCount += 1
+    onPresent?()
   }
 
   @objc(dismissPictureInPictureWithCompletionHandler:)
@@ -49,7 +55,42 @@ final class MacPrivatePiPViewControllerProbe: NSViewController {
     completion: @escaping @convention(block) () -> Void
   ) {
     dismissCount += 1
-    completion()
+    pendingDismissalCompletion = { completion() }
+    if completesDismissalImmediately {
+      completion()
+    }
+  }
+}
+
+@MainActor
+struct MacPrivatePiPTestContext {
+  let player: Player
+  let host: MacNativePiPHostView
+  let controller: MacPrivatePiPViewControllerProbe
+  let presenter: MacPrivatePiPPresenter
+  let mediaController: MacNativePiPMediaController
+
+  init() throws {
+    player = Player(instance: TestInstance.shared)
+    try player.load(Media(url: TestMedia.twosecURL))
+    host = MacNativePiPHostView(frame: CGRect(x: 0, y: 0, width: 960, height: 540))
+    controller = MacPrivatePiPViewControllerProbe()
+    let controller = controller
+    presenter = MacPrivatePiPPresenter(pictureInPictureViewControllerFactory: { controller })
+    mediaController = MacNativePiPMediaController()
+    mediaController.player = player
+  }
+
+  func start(onActiveChanged: @escaping @MainActor @Sendable (Bool) -> Void = { _ in }) -> Bool {
+    presenter.start(
+      player: player,
+      hostView: host,
+      drawableView: host.drawableView,
+      mediaController: mediaController,
+      onActiveChanged: onActiveChanged,
+      onPlay: {},
+      onPause: {}
+    )
   }
 }
 
