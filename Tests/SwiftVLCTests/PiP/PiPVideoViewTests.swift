@@ -583,7 +583,7 @@ extension Integration {
         hostView: host,
         drawableView: drawable,
         mediaController: mediaController,
-        onActiveChanged: { activeStates.append($0) },
+        onActiveChanged: { isActive, _ in activeStates.append(isActive) },
         onPlay: {},
         onPause: {}
       )
@@ -625,7 +625,7 @@ extension Integration {
         hostView: host,
         drawableView: drawable,
         mediaController: mediaController,
-        onActiveChanged: { activeStates.append($0) },
+        onActiveChanged: { isActive, _ in activeStates.append(isActive) },
         onPlay: {},
         onPause: {}
       )
@@ -666,7 +666,7 @@ extension Integration {
         hostView: host,
         drawableView: host.drawableView,
         mediaController: mediaController,
-        onActiveChanged: { activeStates.append($0) },
+        onActiveChanged: { isActive, _ in activeStates.append(isActive) },
         onPlay: {},
         onPause: {}
       )
@@ -755,7 +755,7 @@ extension Integration {
           hostView: host,
           drawableView: host.drawableView,
           mediaController: mediaController,
-          onActiveChanged: { _ in },
+          onActiveChanged: { _, _ in },
           onPlay: {},
           onPause: {}
         )
@@ -807,7 +807,7 @@ extension Integration {
             hostView: successorHost,
             drawableView: successorHost.drawableView,
             mediaController: context.mediaController,
-            onActiveChanged: { successorStates.append($0) },
+            onActiveChanged: { isActive, _ in successorStates.append(isActive) },
             onPlay: {},
             onPause: {}
           )

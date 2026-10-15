@@ -49,6 +49,24 @@ extension Player {
 #endif
 
 #if os(macOS)
+/// Source-owned identity of an actual macOS native PiP activation.
+@_spi(PrivateMacOSPiP)
+public struct MacPiPActivationIdentity: Sendable, Hashable {
+  public let activationRevision: UInt64
+  public let playbackGeneration: PlaybackGeneration
+  public let nativeGeneration: NativePlayerGeneration
+
+  public init(
+    activationRevision: UInt64,
+    playbackGeneration: PlaybackGeneration,
+    nativeGeneration: NativePlayerGeneration
+  ) {
+    self.activationRevision = activationRevision
+    self.playbackGeneration = playbackGeneration
+    self.nativeGeneration = nativeGeneration
+  }
+}
+
 /// Durable command-ordering handoff for one native macOS PiP activation.
 /// Reselection submission does not establish that the renderer composed a frame.
 @_spi(PrivateMacOSPiP)
@@ -75,6 +93,16 @@ public struct MacPiPOutputRebindSnapshot: Sendable, Equatable {
     self.playbackGeneration = playbackGeneration
     self.nativeGeneration = nativeGeneration
     self.phase = phase
+  }
+}
+
+extension MacPiPOutputRebindSnapshot {
+  var activationIdentity: MacPiPActivationIdentity {
+    MacPiPActivationIdentity(
+      activationRevision: activationRevision,
+      playbackGeneration: playbackGeneration,
+      nativeGeneration: nativeGeneration
+    )
   }
 }
 

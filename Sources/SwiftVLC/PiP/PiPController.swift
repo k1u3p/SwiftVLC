@@ -692,8 +692,8 @@ public final class PiPController: NSObject {
     playbackDelegateProxy.owner = self
     nativeBackend.owner = self
     updatePiPPossible(nativeBackend.isPossible)
-    updatePiPActive(nativeBackend.isActive)
-    if nativeBackend.isActive {
+    updatePiPActive(nativeBackend.isActive(for: player))
+    if nativeBackend.isActive(for: player) {
       adoptActivePiPLifecycleAttribution(
         mediaGeneration: nativeBackend.activeMediaGeneration
       )
@@ -936,6 +936,18 @@ public final class PiPController: NSObject {
     guard activePublicationRevision == revision else { return }
     publishPiPSnapshot()
   }
+
+  #if os(macOS)
+  /// A native batch publishes one final live snapshot, including a new media
+  /// identity when both flags stayed unchanged throughout a rapid open/close.
+  func reconcileMacNativePiPActiveState(_ isActive: Bool) {
+    let previousRevision = pipSnapshotRevision
+    updatePiPActive(isActive)
+    if nativeBackend?.owner === self, pipSnapshotRevision == previousRevision {
+      publishPiPSnapshot()
+    }
+  }
+  #endif
 
   /// Publishes the current flags as one value.
   ///
@@ -1214,7 +1226,9 @@ public final class PiPController: NSObject {
     _ isActive: Bool,
     mediaGeneration: PlaybackGeneration? = nil,
     forceTransitionEvent: Bool = false,
-    preservesCurrentLifecycle: Bool = false
+    preservesCurrentLifecycle: Bool = false,
+    nativeSource: PiPNativeEventSource? = nil,
+    updatesActiveState: Bool = true
   ) {
     #if os(iOS)
     if isActive {
@@ -1226,17 +1240,18 @@ public final class PiPController: NSObject {
     }
     #endif
     let changed = self.isActive != isActive
-    updatePiPActive(isActive)
+    if updatesActiveState { updatePiPActive(isActive) }
     guard changed || forceTransitionEvent else { return }
     if preservesCurrentLifecycle {
       publishTransferredNativePiPEvent(
         isActive ? .didStart : .didStop(reason: .unknown),
-        mediaGeneration: mediaGeneration
+        mediaGeneration: mediaGeneration,
+        nativeSource: nativeSource
       )
       return
     }
     if isActive {
-      publishPiPEvent(.didStart, mediaGeneration: mediaGeneration)
+      publishPiPEvent(.didStart, mediaGeneration: mediaGeneration, nativeSource: nativeSource)
     } else {
       // This synthesized fallback cannot distinguish an unprompted native
       // close, so its version-1 event must remain `.unknown`. Preserve any
@@ -1247,7 +1262,8 @@ public final class PiPController: NSObject {
       publishPiPEvent(
         .didStop(reason: .unknown),
         stopCause: cause,
-        mediaGeneration: mediaGeneration
+        mediaGeneration: mediaGeneration,
+        nativeSource: nativeSource
       )
     }
   }

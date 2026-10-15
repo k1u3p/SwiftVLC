@@ -152,6 +152,56 @@ public struct PiPEventEnvelope: Sendable {
   /// AVKit controller or native-backend generation that emitted the event.
   /// Ordering is meaningful only within the owning ``PiPController``.
   public let controllerGeneration: UInt64
+
+  #if os(macOS)
+  /// Identity captured by the native presenter before deferred lifecycle
+  /// delivery. Historical starts/stops retain this identity after re-entry.
+  @_spi(PrivateMacOSPiP)
+  public let macPiPActivationIdentity: MacPiPActivationIdentity?
+
+  init(
+    event: PiPEvent,
+    stopCause: PiPStopCause?,
+    mediaGeneration: PlaybackGeneration,
+    controllerGeneration: UInt64,
+    macPiPActivationIdentity: MacPiPActivationIdentity? = nil
+  ) {
+    self.event = event
+    self.stopCause = stopCause
+    self.mediaGeneration = mediaGeneration
+    self.controllerGeneration = controllerGeneration
+    self.macPiPActivationIdentity = macPiPActivationIdentity
+  }
+  #endif
+
+  func attributed(to source: PiPNativeEventSource?) -> Self {
+    #if os(macOS)
+    guard let source else { return self }
+    return Self(
+      event: event,
+      stopCause: stopCause,
+      mediaGeneration: source.mediaGeneration,
+      controllerGeneration: controllerGeneration,
+      macPiPActivationIdentity: source.macPiPActivationIdentity
+    )
+    #else
+    return self
+    #endif
+  }
+}
+
+/// Internal source-time metadata. Other platform routes keep their existing
+/// attribution; only the macOS native producer supplies this value.
+struct PiPNativeEventSource: Sendable {
+  let mediaGeneration: PlaybackGeneration
+  #if os(macOS)
+  let macPiPActivationIdentity: MacPiPActivationIdentity?
+
+  init(mediaGeneration: PlaybackGeneration, macPiPActivationIdentity: MacPiPActivationIdentity? = nil) {
+    self.mediaGeneration = mediaGeneration
+    self.macPiPActivationIdentity = macPiPActivationIdentity
+  }
+  #endif
 }
 
 // MARK: - Lifecycle event stream
@@ -244,7 +294,8 @@ extension PiPController {
   func publishPiPEvent(
     _ event: PiPEvent,
     stopCause: PiPStopCause? = nil,
-    mediaGeneration mediaGenerationOverride: PlaybackGeneration? = nil
+    mediaGeneration mediaGenerationOverride: PlaybackGeneration? = nil,
+    nativeSource: PiPNativeEventSource? = nil
   ) {
     let attribution: PiPLifecycleAttribution
     var consumedFailedLifecycle = false
@@ -337,7 +388,7 @@ extension PiPController {
       stopCause: stopCause ?? event.compatibilityStopCause,
       mediaGeneration: attribution.mediaGeneration,
       controllerGeneration: attribution.controllerGeneration
-    )
+    ).attributed(to: nativeSource)
     pipEventBroadcaster.broadcast(event)
     pipEventEnvelopeBroadcaster.broadcast(envelope)
 
@@ -363,7 +414,8 @@ extension PiPController {
   func publishTransferredNativePiPEvent(
     _ event: PiPEvent,
     stopCause: PiPStopCause? = nil,
-    mediaGeneration: PlaybackGeneration?
+    mediaGeneration: PlaybackGeneration?,
+    nativeSource: PiPNativeEventSource? = nil
   ) {
     let attribution = makePiPLifecycleAttribution(mediaGeneration: mediaGeneration)
     pipEventBroadcaster.broadcast(event)
@@ -372,7 +424,7 @@ extension PiPController {
       stopCause: stopCause ?? event.compatibilityStopCause,
       mediaGeneration: attribution.mediaGeneration,
       controllerGeneration: attribution.controllerGeneration
-    ))
+    ).attributed(to: nativeSource))
   }
 
   private func currentPiPLifecycleAttribution(

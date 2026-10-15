@@ -84,6 +84,12 @@ extension PiPController {
   /// belongs, on ``pipEventEnvelopes`` (or the compatibility ``pipEvents``
   /// stream when generation attribution is not needed).
   public func requestStart() -> PiPStartResult {
+    #if os(macOS)
+    if let nativeBackend {
+      guard nativeBackend.owner === self else { return .backendUnavailable }
+      nativeBackend.resetStartActivationIdentity()
+    }
+    #endif
     guard player.currentMedia != nil else { return .noMedia }
     #if os(iOS)
     if let nativeBackend {
@@ -119,6 +125,9 @@ extension PiPController {
   /// ``pipEventEnvelopes`` stream reports
   /// ``PiPStopCause/programmatic`` through ``PiPEventEnvelope/stopCause``.
   public func stop() {
+    #if os(macOS)
+    if let nativeBackend, nativeBackend.owner !== self { return }
+    #endif
     // Recorded unconditionally: between AVKit beginning the start
     // animation and the didStart callback, `isActive` is still false,
     // and a stop issued in that window would otherwise be reported as

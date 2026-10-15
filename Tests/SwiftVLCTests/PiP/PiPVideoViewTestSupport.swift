@@ -87,7 +87,7 @@ struct MacPrivatePiPTestContext {
       hostView: host,
       drawableView: host.drawableView,
       mediaController: mediaController,
-      onActiveChanged: onActiveChanged,
+      onActiveChanged: { isActive, _ in onActiveChanged(isActive) },
       onPlay: {},
       onPause: {}
     )

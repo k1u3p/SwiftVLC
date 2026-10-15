@@ -17,6 +17,7 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
   let mediaController = MacNativePiPMediaController()
   weak var owner: PiPController? {
     didSet {
+      if oldValue !== owner { resetStartActivationIdentity() }
       ownerGeneration &+= 1
       scheduleActiveTransitionDeliveryIfNeeded()
     }
@@ -25,7 +26,26 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
   weak var hostView: MacNativePiPHostView?
   weak var drawableView: MacNativePiPDrawableView?
 
-  private let presenter = MacPrivatePiPPresenter()
+  private let presenter: MacPrivatePiPPresenter
+  private let runtimeIsAvailable: @MainActor () -> Bool
+  private(set) var startActivationIdentity: MacPiPActivationIdentity?
+  private var activeActivationIdentity: MacPiPActivationIdentity?
+  private var activePlayerIdentity: ObjectIdentifier?
+  private var lastSignaledActivationIdentity: MacPiPActivationIdentity?
+  private var lastSignaledPlayerIdentity: ObjectIdentifier?
+
+  init(
+    presenter: MacPrivatePiPPresenter? = nil,
+    runtimeIsAvailable: @escaping @MainActor () -> Bool = { MacPrivatePiPPresenter.isRuntimeAvailable }
+  ) {
+    self.presenter = presenter ?? MacPrivatePiPPresenter()
+    self.runtimeIsAvailable = runtimeIsAvailable
+    super.init()
+  }
+
+  func resetStartActivationIdentity() {
+    startActivationIdentity = nil
+  }
   private(set) var isPossible = false
   private(set) var isActive = false
   private(set) var activeMediaGeneration: PlaybackGeneration?
@@ -34,6 +54,7 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
     let mediaGeneration: PlaybackGeneration?
     let playerIdentity: ObjectIdentifier
     let ownerGeneration: UInt64
+    let activationIdentity: MacPiPActivationIdentity?
   }
 
   private var ownerGeneration: UInt64 = 0
@@ -79,6 +100,7 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
   }
 
   func start() -> PiPStartResult {
+    resetStartActivationIdentity()
     guard mediaController.player?.currentMedia != nil else {
       return .noMedia
     }
@@ -101,8 +123,9 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
       hostView: hostView,
       drawableView: drawableView,
       mediaController: mediaController,
-      onActiveChanged: { [weak self] isActive in
-        self?.setActive(isActive)
+      onActiveChanged: { [weak self, weak player] isActive, identity in
+        guard let player else { return }
+        self?.setActive(isActive, activationIdentity: identity, sourcePlayer: player)
       },
       onPlay: { [weak self] in
         self?.handleSetPlaying(true)
@@ -117,6 +140,7 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
       setPossible(false)
       return .notPossible
     }
+    startActivationIdentity = activeActivationIdentity
     return .accepted
   }
 
@@ -140,7 +164,7 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
     }
     setPossible(
       mediaController.player?.instance.usesPiPSafeDarwinDisplay == true
-        && MacPrivatePiPPresenter.isRuntimeAvailable
+        && runtimeIsAvailable()
     )
   }
 
@@ -152,33 +176,60 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
     }
   }
 
-  func setActive(_ isActive: Bool) {
-    guard self.isActive != isActive else { return }
+  func setActive(
+    _ isActive: Bool,
+    activationIdentity: MacPiPActivationIdentity? = nil,
+    sourcePlayer: Player? = nil
+  ) {
     let signaledOwner = owner
+    let player = sourcePlayer ?? signaledOwner?.player ?? mediaController.player
+    let playerIdentity = player.map(ObjectIdentifier.init)
+    let signaledActivation = activationIdentity
+      ?? (isActive ? player?.macPiPOutputRebindSnapshot?.activationIdentity : nil)
     if isActive {
-      let signaledMediaGeneration = signaledOwner?.player.generation
-        ?? mediaController.player?.generation
-      activeMediaGeneration = signaledOwner?.attributedNativePiPStartMediaGeneration(
-        signaledMediaGeneration: signaledMediaGeneration,
-        preservesAcceptedRequest: true
-      ) ?? signaledMediaGeneration
+      if let sourcePlayer, mediaController.player !== sourcePlayer { return }
+      if let signaledActivation, let lastSignaledActivationIdentity,
+        playerIdentity == lastSignaledPlayerIdentity {
+        guard signaledActivation.activationRevision > lastSignaledActivationIdentity.activationRevision else { return }
+      }
+    }
+    if !isActive, let activationIdentity, let activeActivationIdentity {
+      guard activationIdentity == activeActivationIdentity,
+        playerIdentity == activePlayerIdentity else { return }
+    }
+    guard self.isActive != isActive else { return }
+    if isActive {
+      // Actual presenter callbacks pass their immutable identity explicitly.
+      // The fallback supports legacy internal callers at signal time only.
+      activeActivationIdentity = signaledActivation
+      activePlayerIdentity = playerIdentity
+      if let signaledActivation {
+        lastSignaledActivationIdentity = signaledActivation
+        lastSignaledPlayerIdentity = playerIdentity
+      }
+      let signaledMediaGeneration = player?.generation
+      activeMediaGeneration = activeActivationIdentity?.playbackGeneration
+        ?? signaledOwner?.attributedNativePiPStartMediaGeneration(
+          signaledMediaGeneration: signaledMediaGeneration,
+          preservesAcceptedRequest: true
+        ) ?? signaledMediaGeneration
     }
     let lifecycleMediaGeneration = activeMediaGeneration
+    let lifecycleActivation = activeActivationIdentity
+    let lifecyclePlayer = activePlayerIdentity ?? playerIdentity
     self.isActive = isActive
     if !isActive {
       activeMediaGeneration = nil
+      activeActivationIdentity = nil
+      activePlayerIdentity = nil
     }
-    // A same-player SwiftUI reconstruction can replace `owner` before this
-    // deferred delivery runs. Persist transitions that were signalled to a
-    // live owner and route them to whichever controller currently owns that
-    // player's adopted backend. Initial ownerless state is still adopted from
-    // `isActive` and must not synthesize a historical event.
-    guard let signaledOwner else { return }
+    guard signaledOwner != nil, let lifecyclePlayer else { return }
     pendingActiveTransitions.append(PendingActiveTransition(
       isActive: isActive,
       mediaGeneration: lifecycleMediaGeneration,
-      playerIdentity: ObjectIdentifier(signaledOwner.player),
-      ownerGeneration: ownerGeneration
+      playerIdentity: lifecyclePlayer,
+      ownerGeneration: ownerGeneration,
+      activationIdentity: lifecycleActivation
     ))
     scheduleActiveTransitionDeliveryIfNeeded()
   }
@@ -205,9 +256,20 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
         transition.isActive,
         mediaGeneration: transition.mediaGeneration,
         forceTransitionEvent: true,
-        preservesCurrentLifecycle: transition.ownerGeneration != ownerGeneration
+        preservesCurrentLifecycle: transition.ownerGeneration != ownerGeneration,
+        nativeSource: transition.mediaGeneration.map {
+          PiPNativeEventSource(mediaGeneration: $0, macPiPActivationIdentity: transition.activationIdentity)
+        },
+        updatesActiveState: false
       )
     }
+    // Queued transitions are historical evidence. Publish live presentation
+    // only once from the backend's final state, never replay a closed window.
+    owner.reconcileMacNativePiPActiveState(isActive(for: owner.player))
+  }
+
+  func isActive(for player: Player) -> Bool {
+    isActive && (activePlayerIdentity == nil || activePlayerIdentity == ObjectIdentifier(player))
   }
 
   private func handleSetPlaying(_ playing: Bool) {
@@ -218,6 +280,20 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
     } else {
       mediaController.pause()
     }
+  }
+}
+
+extension PiPController {
+  /// Synchronous controller identity for ownership captured before a request.
+  @_spi(PrivateMacOSPiP)
+  public var macPiPControllerGeneration: UInt64 { pipControllerGeneration }
+
+  /// Identity of this controller's most recent successful native start request.
+  /// Retained across close and cleared before every new request, including refusals.
+  @_spi(PrivateMacOSPiP)
+  public var macPiPStartActivationIdentity: MacPiPActivationIdentity? {
+    guard let nativeBackend, nativeBackend.owner === self else { return nil }
+    return nativeBackend.startActivationIdentity
   }
 }
 
@@ -233,7 +309,7 @@ final class MacPrivatePiPPresenter {
   private var pictureInPictureViewController: NSViewController?
   private var contentViewController: NSViewController?
   private var delegate: MacPrivatePiPDelegate?
-  private var onActiveChanged: (@MainActor @Sendable (Bool) -> Void)?
+  private var onActiveChanged: (@MainActor @Sendable (Bool, MacPiPActivationIdentity?) -> Void)?
   private var dismissalCompletion: MacPrivatePiPDismissCompletion?
   private var isClosing = false
   private var nextPresentationToken: UInt64 = 0
@@ -242,19 +318,20 @@ final class MacPrivatePiPPresenter {
     weak var player: Player?
     weak var hostView: MacNativePiPHostView?
     weak var drawableView: MacNativePiPDrawableView?
-    let activationRevision: UInt64
+    let activationIdentity: MacPiPActivationIdentity
+    var activationRevision: UInt64 { activationIdentity.activationRevision }
     var isAbandoned = false
 
     init(
       player: Player,
       hostView: MacNativePiPHostView,
       drawableView: MacNativePiPDrawableView,
-      activationRevision: UInt64
+      activationIdentity: MacPiPActivationIdentity
     ) {
       self.player = player
       self.hostView = hostView
       self.drawableView = drawableView
-      self.activationRevision = activationRevision
+      self.activationIdentity = activationIdentity
     }
 
     func matches(hostView: MacNativePiPHostView, drawableView: MacNativePiPDrawableView) -> Bool {
@@ -293,7 +370,6 @@ final class MacPrivatePiPPresenter {
 
   func abandonRestorationTarget() {
     outputReturn?.abandon()
-    outputReturn = nil
     for pendingReturn in pendingOutputReturns {
       pendingReturn.abandon()
     }
@@ -311,7 +387,6 @@ final class MacPrivatePiPPresenter {
     }
     guard self.hostView === hostView, self.drawableView === drawableView else { return }
     outputReturn?.abandon()
-    outputReturn = nil
     self.hostView = nil
     self.drawableView = nil
   }
@@ -321,7 +396,7 @@ final class MacPrivatePiPPresenter {
     hostView: MacNativePiPHostView,
     drawableView: MacNativePiPDrawableView,
     mediaController: MacNativePiPMediaController,
-    onActiveChanged: @escaping @MainActor @Sendable (Bool) -> Void,
+    onActiveChanged: @escaping @MainActor @Sendable (Bool, MacPiPActivationIdentity?) -> Void,
     onPlay: @escaping @MainActor @Sendable () -> Void,
     onPause: @escaping @MainActor @Sendable () -> Void
   ) -> Bool {
@@ -352,9 +427,16 @@ final class MacPrivatePiPPresenter {
     delegate.didClose = { [weak self] in
       self?.finish(presentationToken)
     }
-    delegate.play = onPlay
-    delegate.pause = onPause
-    delegate.stop = onPause
+    delegate.play = { [weak self] in
+      guard self?.presentationToken == presentationToken else { return }
+      onPlay()
+    }
+    let pause: @MainActor @Sendable () -> Void = { [weak self] in
+      guard self?.presentationToken == presentationToken else { return }
+      onPause()
+    }
+    delegate.pause = pause
+    delegate.stop = pause
     self.delegate = delegate
 
     let contentViewController = NSViewController()
@@ -376,7 +458,8 @@ final class MacPrivatePiPPresenter {
     }
 
     guard self.presentationToken == presentationToken, !isClosing else { return false }
-    guard let activationRevision = player.beginMacPiPOutputRebindActivation() else {
+    guard player.beginMacPiPOutputRebindActivation() != nil,
+      let activationIdentity = player.macPiPOutputRebindSnapshot?.activationIdentity else {
       finish(presentationToken)
       return false
     }
@@ -384,7 +467,7 @@ final class MacPrivatePiPPresenter {
       player: player,
       hostView: hostView,
       drawableView: drawableView,
-      activationRevision: activationRevision
+      activationIdentity: activationIdentity
     )
     _ = pictureInPictureViewController.perform(
       MacPrivatePiPSelector.present,
@@ -395,7 +478,7 @@ final class MacPrivatePiPPresenter {
       self.pictureInPictureViewController === pictureInPictureViewController,
       !isClosing
     else { return false }
-    onActiveChanged(true)
+    onActiveChanged(true, activationIdentity)
     return true
   }
 
@@ -516,7 +599,7 @@ final class MacPrivatePiPPresenter {
     drawableView = nil
     onActiveChanged = nil
 
-    activeChanged?(false)
+    activeChanged?(false, returningOutput?.activationIdentity)
     if let returningOutput {
       if
         !returningOutput.isAbandoned,
