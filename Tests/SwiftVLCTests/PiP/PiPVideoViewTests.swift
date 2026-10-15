@@ -607,6 +607,107 @@ extension Integration {
     }
 
     @Test
+    func `macOS private PiP rapid stop waits for content appearance before native dismissal`() async throws {
+      let context = try MacPrivatePiPTestContext()
+      context.controller.completesPresentationImmediately = false
+      context.controller.completesDismissalImmediately = false
+      var activeStates: [Bool] = []
+      let started = context.start { activeStates.append($0) }
+      #expect(started)
+      let content = try #require(context.controller.presentedViewController)
+      let activation = try #require(context.player.macPiPOutputRebindSnapshot)
+
+      context.presenter.stop()
+      context.presenter.stop()
+
+      #expect(context.controller.dismissCount == 0)
+      #expect(content.view === context.host.drawableView)
+      #expect(context.host.drawableView.superview !== context.host)
+      #expect(context.player.macPiPOutputRebindSnapshot == activation)
+      expectNoDifference(activeStates, [true])
+      #expect(!context.start())
+
+      content.viewDidAppear()
+
+      #expect(context.controller.dismissCount == 1)
+      #expect(context.host.drawableView.superview === context.host)
+      expectNoDifference(activeStates, [true])
+      content.viewDidAppear()
+      context.presenter.stop()
+      #expect(context.controller.dismissCount == 1)
+      let complete = try #require(context.controller.pendingDismissalCompletion)
+      complete()
+      await Task.yield()
+      expectNoDifference(activeStates, [true, false])
+    }
+
+    @Test
+    func `macOS private PiP system close consumes a pending stop before appearance`() throws {
+      let context = try MacPrivatePiPTestContext()
+      context.controller.completesPresentationImmediately = false
+      #expect(context.start())
+      let content = try #require(context.controller.presentedViewController)
+      let delegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      context.presenter.stop()
+      #expect(delegate.shouldClose())
+
+      content.viewDidAppear()
+
+      #expect(context.controller.dismissCount == 0)
+      delegate.willClose()
+      delegate.didClose()
+      #expect(context.host.drawableView.superview === context.host)
+    }
+
+    @Test
+    func `macOS private PiP abandoned pending close never restores or rebinds output`() throws {
+      let context = try MacPrivatePiPTestContext()
+      context.controller.completesPresentationImmediately = false
+      context.controller.completesDismissalImmediately = false
+      #expect(context.start())
+      let content = try #require(context.controller.presentedViewController)
+      context.presenter.stop()
+      context.presenter.abandonRestorationTarget()
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+
+      content.viewDidAppear()
+
+      #expect(context.controller.dismissCount == 1)
+      #expect(content.view === context.host.drawableView)
+      #expect(context.host.drawableView.superview !== context.host)
+      let delegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      delegate.didClose()
+      #expect(context.player.macPiPOutputRebindSnapshot?.phase == .aborted)
+      #expect(context.host.drawableView.superview !== context.host)
+    }
+
+    @Test
+    func `macOS private PiP retired appearance cannot dismiss a successor`() throws {
+      let context = try MacPrivatePiPTestContext()
+      context.controller.completesPresentationImmediately = false
+      context.controller.completesDismissalImmediately = false
+      #expect(context.start())
+      let retiredContent = try #require(context.controller.presentedViewController)
+      let retiredDelegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      context.presenter.stop()
+      retiredDelegate.willClose()
+      retiredDelegate.didClose()
+      #expect(context.start())
+      let successorContent = try #require(context.controller.presentedViewController)
+      context.presenter.stop()
+      let dismissCount = context.controller.dismissCount
+
+      retiredContent.viewDidAppear()
+
+      #expect(context.controller.dismissCount == dismissCount)
+      #expect(successorContent.view === context.host.drawableView)
+      successorContent.viewDidAppear()
+      #expect(context.controller.dismissCount == dismissCount + 1)
+      let successorDelegate = try #require(context.controller.delegate as? MacPrivatePiPDelegate)
+      successorDelegate.didClose()
+    }
+
+    @Test
     func `macOS private PiP delegate prepares the presenter for system close`() throws {
       let player = Player(instance: TestInstance.shared)
       try player.load(Media(url: TestMedia.twosecURL))

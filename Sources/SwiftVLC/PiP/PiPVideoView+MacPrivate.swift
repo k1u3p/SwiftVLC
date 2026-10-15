@@ -312,6 +312,8 @@ final class MacPrivatePiPPresenter {
   private var onActiveChanged: (@MainActor @Sendable (Bool, MacPiPActivationIdentity?) -> Void)?
   private var dismissalCompletion: MacPrivatePiPDismissCompletion?
   private var isClosing = false
+  private var hasPresentedContent = false
+  private var closeRequested = false
   private var nextPresentationToken: UInt64 = 0
   private var presentationToken: UInt64?
   @MainActor private final class OutputReturn {
@@ -422,6 +424,8 @@ final class MacPrivatePiPPresenter {
       self?.prepareToClose(presentationToken) ?? true
     }
     delegate.willClose = { [weak self] in
+      guard self?.presentationToken == presentationToken else { return }
+      self?.closeRequested = false
       _ = self?.beginClose(presentationToken)
     }
     delegate.didClose = { [weak self] in
@@ -439,7 +443,13 @@ final class MacPrivatePiPPresenter {
     delegate.stop = pause
     self.delegate = delegate
 
-    let contentViewController = NSViewController()
+    let contentViewController = MacPrivatePiPContentViewController()
+    contentViewController.onDidAppear = { [weak self] content in
+      guard let self, self.presentationToken == presentationToken,
+        self.contentViewController === content else { return }
+      self.hasPresentedContent = true
+      self.dismissRequestedPresentationIfReady(presentationToken)
+    }
     drawableView.removeFromSuperview()
     drawableView.frame = NSRect(origin: .zero, size: normalizedContentSize(from: hostView.bounds.size))
     drawableView.autoresizingMask = [.width, .height]
@@ -484,12 +494,25 @@ final class MacPrivatePiPPresenter {
 
   func stop() {
     guard let presentationToken else { return }
-    guard let pictureInPictureViewController else {
+    guard pictureInPictureViewController != nil else {
       finish(presentationToken)
       return
     }
     guard !isClosing else { return }
+    isClosing = true
+    closeRequested = true
+    dismissRequestedPresentationIfReady(presentationToken)
+  }
 
+  private func dismissRequestedPresentationIfReady(_ presentationToken: UInt64) {
+    guard self.presentationToken == presentationToken,
+      hasPresentedContent, closeRequested,
+      let pictureInPictureViewController else { return }
+    closeRequested = false
+    // The private presenter can return before AppKit has finished opening
+    // the PiP window. Reparenting or dismissing during that transition can
+    // strand its close without a completion. Keep the owned close pending
+    // until the content has genuinely appeared, then restore and dismiss once.
     _ = beginClose(presentationToken)
     if dismissUsingPrivateAPI(pictureInPictureViewController, presentationToken: presentationToken) {
       return
@@ -527,7 +550,9 @@ final class MacPrivatePiPPresenter {
     guard self.presentationToken == presentationToken else { return true }
     guard pictureInPictureViewController != nil else { return true }
     isClosing = true
-    return prepareForClose()
+    let canClose = prepareForClose()
+    if canClose { closeRequested = false }
+    return canClose
   }
 
   @discardableResult
@@ -593,6 +618,8 @@ final class MacPrivatePiPPresenter {
     delegate = nil
     dismissalCompletion = nil
     isClosing = false
+    hasPresentedContent = false
+    closeRequested = false
     self.presentationToken = nil
     outputReturn = nil
     hostView = nil
@@ -701,6 +728,16 @@ final class MacPrivatePiPPresenter {
       return nil
     }
     return NSClassFromString("PIPViewController") as? NSViewController.Type
+  }
+}
+
+@MainActor
+private final class MacPrivatePiPContentViewController: NSViewController {
+  var onDidAppear: (@MainActor (NSViewController) -> Void)?
+
+  override func viewDidAppear() {
+    super.viewDidAppear()
+    onDidAppear?(self)
   }
 }
 

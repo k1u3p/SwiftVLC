@@ -40,6 +40,7 @@ final class MacPrivatePiPViewControllerProbe: NSViewController {
   private(set) var presentCount = 0
   private(set) var dismissCount = 0
   var onPresent: (() -> Void)?
+  var completesPresentationImmediately = true
   var completesDismissalImmediately = true
   private(set) var pendingDismissalCompletion: (() -> Void)?
 
@@ -48,6 +49,9 @@ final class MacPrivatePiPViewControllerProbe: NSViewController {
     presentedViewController = viewController
     presentCount += 1
     onPresent?()
+    if completesPresentationImmediately {
+      viewController.viewDidAppear()
+    }
   }
 
   @objc(dismissPictureInPictureWithCompletionHandler:)
