@@ -376,14 +376,16 @@ final class MacPrivatePiPPresenter {
     }
 
     guard self.presentationToken == presentationToken, !isClosing else { return false }
-    if let activationRevision = player.beginMacPiPOutputRebindActivation() {
-      outputReturn = OutputReturn(
-        player: player,
-        hostView: hostView,
-        drawableView: drawableView,
-        activationRevision: activationRevision
-      )
+    guard let activationRevision = player.beginMacPiPOutputRebindActivation() else {
+      finish(presentationToken)
+      return false
     }
+    outputReturn = OutputReturn(
+      player: player,
+      hostView: hostView,
+      drawableView: drawableView,
+      activationRevision: activationRevision
+    )
     _ = pictureInPictureViewController.perform(
       MacPrivatePiPSelector.present,
       with: contentViewController

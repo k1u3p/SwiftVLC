@@ -565,8 +565,9 @@ extension Integration {
     }
 
     @Test
-    func `macOS private PiP close restores the drawable before dismissal`() async {
+    func `macOS private PiP close restores the drawable before dismissal`() async throws {
       let player = Player(instance: TestInstance.shared)
+      try player.load(Media(url: TestMedia.twosecURL))
       let host = MacNativePiPHostView(frame: CGRect(x: 0, y: 0, width: 960, height: 540))
       let drawable = host.drawableView
       let controller = MacPrivatePiPViewControllerProbe()
@@ -608,6 +609,7 @@ extension Integration {
     @Test
     func `macOS private PiP delegate prepares the presenter for system close`() throws {
       let player = Player(instance: TestInstance.shared)
+      try player.load(Media(url: TestMedia.twosecURL))
       let host = MacNativePiPHostView(frame: CGRect(x: 0, y: 0, width: 960, height: 540))
       let drawable = host.drawableView
       let controller = MacPrivatePiPViewControllerProbe()
@@ -637,6 +639,46 @@ extension Integration {
       #expect(drawable.superview === host)
       #expect(presenter.isActive == false)
       expectNoDifference(activeStates, [true, false])
+    }
+
+    @Test(arguments: ["missing-media", "shutdown", "retired-handle"])
+    func `macOS private PiP rejects presentation without an owned output activation`(invalidity: String) async throws {
+      let player = Player(instance: TestInstance.shared)
+      if invalidity != "missing-media" {
+        try player.load(Media(url: TestMedia.twosecURL))
+      }
+      if invalidity == "shutdown" {
+        player.isShutdown = true
+      } else if invalidity == "retired-handle" {
+        player.nativePlayerNeedsReplacementBeforePlayback = true
+        player.nativePlayerReplacementHasCommittedMediaGeneration = true
+      }
+      defer { player.isShutdown = false }
+      let host = MacNativePiPHostView()
+      let controller = MacPrivatePiPViewControllerProbe()
+      let presenter = MacPrivatePiPPresenter(pictureInPictureViewControllerFactory: { controller })
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+      var activeStates: [Bool] = []
+
+      let didStart = presenter.start(
+        player: player,
+        hostView: host,
+        drawableView: host.drawableView,
+        mediaController: mediaController,
+        onActiveChanged: { activeStates.append($0) },
+        onPlay: {},
+        onPause: {}
+      )
+
+      #expect(!didStart)
+      #expect(!presenter.isActive)
+      #expect(controller.presentCount == 0)
+      #expect(!activeStates.contains(true))
+      #expect(player.macPiPOutputRebindSnapshot == nil)
+      #expect(host.drawableView.superview === host)
+      presenter.stop()
+      await Task.yield()
     }
 
     @Test
