@@ -252,7 +252,70 @@ extension Integration {
       expectNoDifference(events, ["selected:none"])
     }
 
-    @Test(arguments: ["activation", "playback", "native", "abandoned", "cancelled"])
+    @Test(arguments: ["queued", "suspended", "retained"])
+    func `reentry preserves the selected video track through both output returns`(timing: String) async throws {
+      let player = Player(instance: TestInstance.shared)
+      player.eventTask?.cancel()
+      await player.eventTask?.value
+      try player.load(Media(url: TestMedia.twosecURL))
+      player._setStateForTesting(state: .playing)
+      let activation = try #require(player.beginMacPiPOutputRebindActivation())
+      var selectedTrack: String? = "video"
+      var continuation: CheckedContinuation<Void, Never>?
+      var waits = 0
+      var operations: [String] = []
+      let native = MacVideoOutputRecoveryNativeOperations(
+        selectedTrackID: { _ in selectedTrack },
+        unselectVideoTrack: { _ in
+          operations.append("unselect")
+          if timing == "queued" { selectedTrack = nil }
+        },
+        reselectVideoTrack: { _, id in
+          selectedTrack = id
+          operations.append("reselect:\(id)")
+        },
+        waitForDeselection: {
+          waits += 1
+          if waits == 1 {
+            await withCheckedContinuation { continuation = $0 }
+          }
+        }
+      )
+      let firstReturn = try #require(player.reopenVideoOutputAfterDrawableWindowMove(
+        using: native, nativePiPActivationRevision: activation
+      ))
+      if timing != "queued" {
+        while continuation == nil { await Task.yield() }
+        if timing == "suspended" { selectedTrack = nil }
+      }
+      let recovering = player.macPiPOutputRebindSnapshot
+
+      #expect(player.beginMacPiPOutputRebindActivation() == nil)
+      #expect(player.macPiPOutputRebindSnapshot == recovering)
+
+      continuation?.resume()
+      await firstReturn.value
+      #expect(selectedTrack == "video")
+      #expect(player.macPiPOutputRebindSnapshot?.phase == .reselectSubmitted(
+        deselectionObserved: timing != "retained"
+      ))
+      expectNoDifference(operations, ["unselect", "reselect:video"])
+
+      let successor = try #require(player.beginMacPiPOutputRebindActivation())
+      #expect(successor > activation)
+      let secondReturn = try #require(player.reopenVideoOutputAfterDrawableWindowMove(
+        using: native, nativePiPActivationRevision: successor
+      ))
+      await secondReturn.value
+      #expect(selectedTrack == "video")
+      #expect(player.macPiPOutputRebindSnapshot?.activationRevision == successor)
+      #expect(player.macPiPOutputRebindSnapshot?.phase == .reselectSubmitted(
+        deselectionObserved: timing == "queued"
+      ))
+      expectNoDifference(operations, ["unselect", "reselect:video", "unselect", "reselect:video"])
+    }
+
+    @Test(arguments: ["playback", "native", "abandoned", "cancelled"])
     func `pending recovery cannot mutate a successor owner`(change: String) async throws {
       let player = Player(instance: TestInstance.shared)
       // These cases control media/state directly. Drain the native event
@@ -278,12 +341,12 @@ extension Integration {
       ))
       while continuation == nil { await Task.yield() }
       switch change {
-      case "activation":
-        _ = try #require(player.beginMacPiPOutputRebindActivation())
       case "playback":
         try player.load(Media(url: TestMedia.twosecURL))
+        _ = try #require(player.beginMacPiPOutputRebindActivation())
       case "native":
         try player.replaceNativePlayerForDrawablePlayback(target: nil)
+        _ = try #require(player.beginMacPiPOutputRebindActivation())
       case "abandoned":
         player.updateMacPiPOutputRebind(activation, phase: .aborted)
       default:

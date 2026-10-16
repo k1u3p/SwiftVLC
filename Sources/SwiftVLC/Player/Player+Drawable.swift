@@ -387,9 +387,18 @@ extension Player {
     macPiPOutputRebindSnapshotStorage
   }
 
+  /// A current return must retain activation ownership until reselection is
+  /// submitted; superseding it earlier would strand its native deselection.
+  var hasPendingMacPiPOutputRebind: Bool {
+    guard let snapshot = macPiPOutputRebindSnapshotStorage else { return false }
+    return snapshot.phase == .recovering
+      && ownsMacPiPOutputRebind(snapshot.activationRevision)
+  }
+
   @discardableResult
   func beginMacPiPOutputRebindActivation() -> UInt64? {
-    guard !isShutdown, currentMedia != nil, nativeHandleRepresentsCurrentMedia else { return nil }
+    guard !isShutdown, currentMedia != nil, nativeHandleRepresentsCurrentMedia,
+      !hasPendingMacPiPOutputRebind else { return nil }
     precondition(macPiPOutputRebindRevision < UInt64.max)
     macPiPOutputRebindRevision += 1
     macPiPOutputRebindSnapshotStorage = MacPiPOutputRebindSnapshot(

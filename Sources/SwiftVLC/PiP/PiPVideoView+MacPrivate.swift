@@ -402,7 +402,9 @@ final class MacPrivatePiPPresenter {
     onPlay: @escaping @MainActor @Sendable () -> Void,
     onPause: @escaping @MainActor @Sendable () -> Void
   ) -> Bool {
-    guard !isClosing else { return false }
+    // A return already deselected this handle's video. Leave its drawable
+    // and activation intact until it has submitted the matching reselect.
+    guard !isClosing, !player.hasPendingMacPiPOutputRebind else { return false }
     if isActive {
       updatePlaybackState(isPlaying: mediaController.isMediaPlaying())
       return true

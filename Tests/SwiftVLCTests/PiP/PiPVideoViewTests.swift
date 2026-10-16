@@ -607,6 +607,67 @@ extension Integration {
     }
 
     @Test
+    func `macOS private PiP refuses reentry before touching a recovering drawable`() async throws {
+      let player = Player(instance: TestInstance.shared)
+      player.eventTask?.cancel()
+      await player.eventTask?.value
+      try player.load(Media(url: TestMedia.twosecURL))
+      player._setStateForTesting(state: .playing)
+      let host = MacNativePiPHostView()
+      let controller = MacPrivatePiPViewControllerProbe()
+      var factoryCalls = 0
+      let presenter = MacPrivatePiPPresenter(pictureInPictureViewControllerFactory: {
+        factoryCalls += 1
+        return controller
+      })
+      let mediaController = MacNativePiPMediaController()
+      mediaController.player = player
+      let activation = try #require(player.beginMacPiPOutputRebindActivation())
+      var selectedTrack: String? = "video"
+      let native = MacVideoOutputRecoveryNativeOperations(
+        selectedTrackID: { _ in selectedTrack },
+        unselectVideoTrack: { _ in selectedTrack = nil },
+        reselectVideoTrack: { _, id in selectedTrack = id },
+        waitForDeselection: {}
+      )
+      let returning = try #require(player.reopenVideoOutputAfterDrawableWindowMove(
+        using: native, nativePiPActivationRevision: activation
+      ))
+      let recovering = player.macPiPOutputRebindSnapshot
+      var activeStates: [Bool] = []
+
+      let accepted = presenter.start(
+        player: player, hostView: host, drawableView: host.drawableView,
+        mediaController: mediaController,
+        onActiveChanged: { active, _ in activeStates.append(active) },
+        onPlay: {}, onPause: {}
+      )
+
+      #expect(!accepted)
+      #expect(factoryCalls == 0)
+      #expect(controller.presentCount == 0)
+      #expect(host.drawableView.superview === host)
+      #expect(player.macPiPOutputRebindSnapshot == recovering)
+      expectNoDifference(activeStates, [])
+      await returning.value
+      #expect(selectedTrack == "video")
+      #expect(player.macPiPOutputRebindSnapshot?.phase == .reselectSubmitted(deselectionObserved: true))
+
+      let retryAccepted = presenter.start(
+        player: player, hostView: host, drawableView: host.drawableView,
+        mediaController: mediaController,
+        onActiveChanged: { active, _ in activeStates.append(active) },
+        onPlay: {}, onPause: {}
+      )
+      #expect(retryAccepted)
+      #expect(factoryCalls == 1)
+      #expect(controller.presentCount == 1)
+      expectNoDifference(activeStates, [true])
+      let delegate = try #require(controller.delegate as? MacPrivatePiPDelegate)
+      delegate.didClose()
+    }
+
+    @Test
     func `macOS private PiP rapid stop waits for content appearance before native dismissal`() async throws {
       let context = try MacPrivatePiPTestContext()
       context.controller.completesPresentationImmediately = false
