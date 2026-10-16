@@ -117,6 +117,8 @@ final class MacNativePiPBackend: NSObject, @unchecked Sendable {
     else {
       return .backendUnavailable
     }
+    // Recovery is temporarily busy, not a loss of native PiP capability.
+    guard !player.hasPendingMacPiPOutputRebind else { return .notPossible }
 
     let didStart = presenter.start(
       player: player,

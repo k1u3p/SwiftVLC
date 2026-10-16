@@ -228,6 +228,59 @@ extension Integration {
     }
 
     @Test
+    func `busy reentry preserves native PiP capability and permits retry after reselection`() async throws {
+      let instance = try VLCInstance(arguments: VLCInstance.defaultArguments + ["--no-audio", "--quiet"])
+      let player = try await makePlayer(instance: instance)
+      player._setStateForTesting(state: .playing)
+      let host = MacNativePiPHostView()
+      let probe = MacPrivatePiPViewControllerProbe()
+      let presenter = MacPrivatePiPPresenter(pictureInPictureViewControllerFactory: { probe })
+      let backend = MacNativePiPBackend(presenter: presenter, runtimeIsAvailable: { true })
+      let initialPrivateAPI = PiPController.allowsPrivateMacOSAPI
+      defer { PiPController.allowsPrivateMacOSAPI = initialPrivateAPI }
+      PiPController.allowsPrivateMacOSAPI = true
+      backend.adopt(hostView: host, drawableView: host.drawableView)
+      backend.attach(to: player)
+      let controller = PiPController(player: player, nativeBackend: backend)
+      #expect(controller.isPossible)
+      let activation = try #require(player.beginMacPiPOutputRebindActivation())
+      var selectedTrack: String? = "video"
+      let native = MacVideoOutputRecoveryNativeOperations(
+        selectedTrackID: { _ in selectedTrack },
+        unselectVideoTrack: { _ in selectedTrack = nil },
+        reselectVideoTrack: { _, id in selectedTrack = id },
+        waitForDeselection: {}
+      )
+      let returning = try #require(player.reopenVideoOutputAfterDrawableWindowMove(
+        using: native, nativePiPActivationRevision: activation
+      ))
+      let recovering = player.macPiPOutputRebindSnapshot
+
+      let refused = controller.requestStart()
+
+      #expect(refused == .notPossible)
+      #expect(backend.isPossible)
+      #expect(backend.owner === controller)
+      #expect(controller.macPiPStartActivationIdentity == nil)
+      #expect(player.macPiPOutputRebindSnapshot == recovering)
+      #expect(selectedTrack == nil)
+      #expect(probe.presentCount == 0)
+      await returning.value
+      await Task.yield()
+      #expect(controller.isPossible)
+      #expect(selectedTrack == "video")
+
+      let retry = controller.requestStart()
+
+      #expect(retry == .accepted)
+      #expect(backend.isPossible)
+      #expect(controller.macPiPStartActivationIdentity?.activationRevision != activation)
+      #expect(probe.presentCount == 1)
+      let delegate = try #require(probe.delegate as? MacPrivatePiPDelegate)
+      delegate.didClose()
+    }
+
+    @Test
     func `retired and closed presenter delegates cannot control a successor`() async throws {
       let player = try await makePlayer()
       let host = MacNativePiPHostView()
