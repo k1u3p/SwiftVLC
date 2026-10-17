@@ -21,7 +21,26 @@ extension Integration {
       #expect(player.activeVideoOutputs == 0)
     }
 
+    @Test
+    func `fresh idle player has no video presentation`() {
+      let player = Player(instance: TestInstance.shared)
+      #expect(player.videoPresentation == nil)
+    }
+
     // MARK: - Observation (ungated)
+
+    @Test
+    func `voutChanged invalidates videoPresentation observation`() {
+      let player = Player(instance: TestInstance.shared)
+      let fired = Mutex(false)
+      withObservationTracking {
+        _ = player.videoPresentation
+      } onChange: {
+        fired.withLock { $0 = true }
+      }
+      player._handleEventForTesting(.voutChanged(1))
+      #expect(fired.withLock { $0 })
+    }
 
     @Test
     func `voutChanged invalidates videoSize observation`() {
@@ -134,6 +153,26 @@ extension Integration {
 
       #expect(player.videoSize == CGSize(width: 64, height: 64))
       #expect(player.activeVideoOutputs >= 1)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func `video playback reports one presentation for the selected track`() async throws {
+      let player = Player(instance: TestInstance.makePlayback())
+      defer { player.stop() }
+
+      try player.play(Media(url: TestMedia.testMP4URL))
+      try #require(
+        await poll(until: { player.videoPresentation != nil }),
+        "Waiting for: selected-track presentation published"
+      )
+
+      let presentation = try #require(player.videoPresentation)
+      // The decoded size stays the stored size; the fixture has square pixels
+      // and the upright orientation, so the displayed shape is the stored one.
+      #expect(presentation.size == CGSize(width: 64, height: 64))
+      #expect(presentation.size == player.videoSize)
+      #expect(presentation.orientation == .topLeft)
+      #expect(presentation.displayAspectRatio == 1)
     }
 
     // MARK: - Audio-only media
